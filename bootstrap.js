@@ -102,12 +102,18 @@ function labels() {
     return {
       moveTo: "移动到分类",
       moveHere: name => `移动到“${name}”`,
+      chooseSource: "先选择要移出的来源分类",
+      source: (name, count) => `从“${name}”移出（${count} 篇）`,
+      unfiled: count => `未分类文献（${count} 篇）`,
       empty: "没有可用的目标分类"
     };
   }
   return {
     moveTo: "Move to Collection",
     moveHere: name => `Move to “${name}”`,
+    chooseSource: "Choose the source collection first",
+    source: (name, count) => `From: ${name} (${count})`,
+    unfiled: count => `Unfiled Items (${count})`,
     empty: "No available destination collections"
   };
 }
@@ -118,13 +124,14 @@ function getMoveState(context) {
     if (rows.length !== 1) return null;
 
     let row = rows[0];
-    if (!row || typeof row.isCollection !== "function" || !row.isCollection()) {
-      return null;
-    }
+    let inCollection = !!row?.isCollection?.();
+    let inLibrary = !!row?.isLibrary?.();
+    if (!inCollection && !inLibrary) return null;
     if (row.editable === false) return null;
 
-    let source = row.ref;
-    if (!source || !source.id || !source.libraryID) return null;
+    let source = inCollection ? row.ref : null;
+    let libraryID = row.ref?.libraryID;
+    if (!libraryID || (inCollection && !source?.id)) return null;
 
     let items = context.items || [];
     if (!items.length) return null;
@@ -134,14 +141,15 @@ function getMoveState(context) {
     if (!items.every(item => item && item.isTopLevelItem && item.isTopLevelItem())) {
       return null;
     }
-    if (!items.every(item => item.libraryID === source.libraryID)) {
+    if (!items.every(item => !item.deleted && item.libraryID === libraryID)) {
       return null;
     }
 
     return {
       source,
       items: items.slice(),
-      libraryID: source.libraryID,
+      libraryID,
+      chooseSource: inLibrary,
       window: context.menuElem?.ownerDocument?.defaultView || null
     };
   }
@@ -237,19 +245,23 @@ function makeCollectionNode(doc, collection, childrenMap, state) {
 }
 
 function buildDynamicPopup(popup, state) {
+  if (state.chooseSource) {
+    buildSourcePopup(popup, state);
+    return;
+  }
   clearPopup(popup);
   let doc = popup.ownerDocument;
 
-  // Refresh objects in case collections changed while the context menu was open.
-  let source = Zotero.Collections.get(state.source.id);
-  if (!source) {
+  // 重新读取来源；没有来源时仅处理未分类文献。
+  let source = state.source ? Zotero.Collections.get(state.source.id) : null;
+  if (state.source && (!source || source.deleted)) {
     popup.appendChild(createMenuItem(doc, labels().empty, null, true));
     return;
   }
   state.source = source;
 
   let all = getAllCollections(state.libraryID)
-    .filter(collection => collection && collection.id !== source.id);
+    .filter(collection => collection && !collection.deleted && collection.id !== source?.id);
 
   if (!all.length) {
     popup.appendChild(createMenuItem(doc, labels().empty, null, true));
@@ -264,7 +276,8 @@ function buildDynamicPopup(popup, state) {
       .filter(collection =>
         collection
         && collection.libraryID === state.libraryID
-        && collection.id !== source.id
+        && !collection.deleted
+        && collection.id !== source?.id
       )
       .slice(0, RECENT_COUNT);
   }
@@ -296,7 +309,7 @@ function buildDynamicPopup(popup, state) {
   // they remain reachable as move targets.
   let roots = all.filter(collection =>
     !collection.parentID
-    || collection.parentID === source.id
+    || collection.parentID === source?.id
     || !allIDs.has(collection.parentID)
   ).sort(compareNames);
 
@@ -305,12 +318,72 @@ function buildDynamicPopup(popup, state) {
   }
 }
 
+// 在资料库视图中按来源分组，不把某个分类以外的所选文献一并移动。
+function buildSourcePopup(popup, state) {
+  clearPopup(popup);
+  let doc = popup.ownerDocument;
+  let items = Zotero.Items.get(state.items.map(item => item.id))
+    .filter(item => item && !item.deleted && item.isTopLevelItem()
+      && item.libraryID === state.libraryID);
+  let collections = getAllCollections(state.libraryID)
+    .filter(collection => collection && !collection.deleted);
+  let choices = collections.map(source => ({
+    source,
+    items: items.filter(item => item.getCollections().includes(source.id))
+  })).filter(choice => choice.items.length)
+    .sort((a, b) => compareNames(
+      { name: getCollectionPathLabel(a.source) },
+      { name: getCollectionPathLabel(b.source) }
+    ));
+  let unfiled = items.filter(item => !item.getCollections().length);
+
+  // 全部未分类时直接显示目标分类，不要求选择不存在的来源。
+  if (!choices.length && unfiled.length) {
+    buildDynamicPopup(popup, {
+      ...state, source: null, items: unfiled, chooseSource: false, unfiledOnly: true
+    });
+    return;
+  }
+  if (!choices.length) {
+    popup.appendChild(createMenuItem(doc, labels().empty, null, true));
+    return;
+  }
+  popup.appendChild(createMenuItem(doc, labels().chooseSource, null, true));
+  function appendSource(label, source, selected, unfiledOnly = false) {
+    let menu = doc.createXULElement("menu");
+    menu.setAttribute("label", label);
+    let destinations = doc.createXULElement("menupopup");
+    let nextState = {
+      ...state, source, items: selected, chooseSource: false,
+      requireSourceMembership: !!source, unfiledOnly
+    };
+    destinations.addEventListener("popupshowing", event => {
+      if (event.target === event.currentTarget) buildDynamicPopup(destinations, nextState);
+    });
+    // 预填菜单项，使原生子菜单在首次展开前可用。
+    destinations.appendChild(createMenuItem(doc, labels().empty, null, true));
+    menu.appendChild(destinations);
+    popup.appendChild(menu);
+  }
+  for (let choice of choices) {
+    appendSource(
+      labels().source(getCollectionPathLabel(choice.source), choice.items.length),
+      choice.source, choice.items
+    );
+  }
+  if (unfiled.length) {
+    popup.appendChild(createSeparator(doc));
+    appendSource(labels().unfiled(unfiled.length), null, unfiled, true);
+  }
+}
+
 async function moveItems(state, target) {
-  let source = Zotero.Collections.get(state.source.id);
+  let source = state.source ? Zotero.Collections.get(state.source.id) : null;
   let destination = Zotero.Collections.get(target.id);
-  if (!source || !destination) return;
-  if (source.id === destination.id) return;
-  if (source.libraryID !== destination.libraryID) {
+  if (!destination || destination.deleted) return;
+  if (state.source && (!source || source.deleted)) return;
+  if (source?.id === destination.id) return;
+  if (destination.libraryID !== state.libraryID || (source && source.libraryID !== state.libraryID)) {
     throw new Error("Move to Collection: source and destination must be in the same library");
   }
 
@@ -321,12 +394,15 @@ async function moveItems(state, target) {
 
   await Zotero.DB.executeTransaction(async () => {
     for (let item of items) {
-      if (item.libraryID !== source.libraryID || !item.isTopLevelItem()) continue;
+      if (item.deleted || item.libraryID !== state.libraryID || !item.isTopLevelItem()) continue;
+      // 菜单展开后来源关系可能变化，执行时再次核对，避免处理无关文献。
+      if (state.requireSourceMembership && !source.hasItem(item)) continue;
+      if (state.unfiledOnly && item.getCollections().length) continue;
 
       if (!destination.hasItem(item)) {
         item.addToCollection(destination.id);
       }
-      if (source.hasItem(item)) {
+      if (source && source.hasItem(item)) {
         item.removeFromCollection(source.id);
       }
 

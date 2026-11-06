@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Move to Collection",
-  "version": "0.1.0",
-  "description": "Adds a right-click 'Move to Collection' submenu for Zotero 10.",
+  "version": "0.1.1",
+  "description": "Move items between collections, including source selection in My Library.",
   "applications": {
     "zotero": {
       "id": "move-to-collection@local.openai",
